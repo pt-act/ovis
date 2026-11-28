@@ -1,0 +1,152 @@
+name: Palette keys macOS reproduction
+
+on:
+  push:
+    branches: [repro/palette-keys-macos-ac1]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: palette-keys-repro-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  baseline:
+    name: Unmodified macOS baseline
+    runs-on: macos-15
+    timeout-minutes: 240
+    env:
+      BASE_SHA: 173ada3cfeaf5ffcae108cf1b31bad7ae62a2462
+      HERDR_VERSION: 0.9.3
+      HERDR_SHA256: 5173a3e0ae42d5d1ab7ebfa5d5e6329f7c3d23f8e1a3677c7ce3231da2884157
+      OVIS_HERDR_BIN: /tmp/ovis4827-herdr-bin/herdr
+      XDG_CONFIG_HOME: /tmp/ovis4827-herdr
+      HERDR_TEST_SESSION: ovis-test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.BASE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the exact unmodified baseline tree
+        run: |
+          test "$(git rev-parse HEAD)" = "$BASE_SHA"
+          test -z "$(git status --short)"
+          printf 'baseline %s\n' "$(git rev-parse HEAD)"
+
+      - uses: ./.github/actions/setup-ci
+        with:
+          node: 'true'
+          pty-host: 'true'
+          cache: none
+
+      - name: Install checksum-pinned macOS herdr
+        run: |
+          mkdir -p "$(dirname "$OVIS_HERDR_BIN")"
+          curl --fail --location --retry 3 "https://github.com/herdrdev/herdr/releases/download/v${HERDR_VERSION}/herdr-macos-aarch64" -o "$OVIS_HERDR_BIN"
+          printf '%s  %s\n' "$HERDR_SHA256" "$OVIS_HERDR_BIN" | shasum -a 256 --check
+          chmod +x "$OVIS_HERDR_BIN"
+          "$OVIS_HERDR_BIN" --version
+
+      - name: Install dependencies, Chromium, and build
+        run: |
+          bun install --frozen-lockfile
+          bun node_modules/playwright-core/cli.js install chromium
+          bun run build
+
+      - name: Run eight eligible unmodified baseline invocations
+        run: |
+          unset HERDR_SOCKET HERDR_SOCKET_PATH HERDR_TEST_LIVE HERDR_TEST_MODE CHROME_PATH
+          if [ -e "$XDG_CONFIG_HOME" ]; then
+            echo "refusing to reuse $XDG_CONFIG_HOME" >&2
+            exit 1
+          fi
+          mkdir -p "$XDG_CONFIG_HOME"
+          artifacts="$RUNNER_TEMP/ovis4827-artifacts"
+          mkdir -p "$artifacts/logs"
+          chrome_path=$(bun -e 'import { chromium } from "playwright-core"; console.log(chromium.executablePath())')
+          {
+            printf 'captured_at_utc: '; date -u '+%Y-%m-%dT%H:%M:%SZ'
+            printf 'git_head: '; git rev-parse HEAD
+            printf 'git_status_before_batch: '; git status --short | tr '\n' ' '; printf '\n'
+            sw_vers
+            printf 'uname_m: '; uname -m
+            printf 'bun: '; bun --version
+            printf 'herdr: '; "$OVIS_HERDR_BIN" --version
+            printf 'chromium_path: %s\n' "$chrome_path"
+            printf 'chromium_version: '; "$chrome_path" --version 2>&1 | sed -n '1p' || true
+            printf 'xdg_config_home: %s\n' "$XDG_CONFIG_HOME"
+            printf 'herdr_test_session: %s\n' "$HERDR_TEST_SESSION"
+          } > "$artifacts/environment.txt"
+
+          results="$artifacts/results.tsv"
+          printf 'attempt\texit_code\teligible\tpalette_pass\ttarget_failure\tlog\n' > "$results"
+          attempt=0
+          eligible_count=0
+          palette_passes=0
+          target_failures=0
+          full_exit_zero=0
+          max_attempts=16
+          while [ "$eligible_count" -lt 8 ] && [ "$attempt" -lt "$max_attempts" ]; do
+            attempt=$((attempt + 1))
+            log="$artifacts/logs/$(printf '%02d' "$attempt").log"
+            if bun scripts/ui-regression.ts >"$log" 2>&1; then
+              exit_code=0
+              full_exit_zero=$((full_exit_zero + 1))
+            else
+              exit_code=$?
+            fi
+            printf '%s\n' "$exit_code" > "$artifacts/logs/$(printf '%02d' "$attempt").exit"
+            is_eligible=0
+            palette_pass=0
+            target_failure=0
+            if grep -q 'PASS palette buttons' "$log"; then
+              is_eligible=1
+              eligible_count=$((eligible_count + 1))
+            fi
+            if grep -q '^PASS palette keys:' "$log"; then
+              palette_pass=1
+              palette_passes=$((palette_passes + 1))
+            elif [ "$is_eligible" -eq 1 ] && grep -Eq 'RUN lists the four panes in their tabs|the row at the pick is still the one the keyboard was on' "$log"; then
+              target_failure=1
+              target_failures=$((target_failures + 1))
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$attempt" "$exit_code" "$is_eligible" "$palette_pass" "$target_failure" "$log" >> "$results"
+          done
+          early_aborts=$((attempt - eligible_count))
+          {
+            printf '# Unmodified palette-keys macOS baseline\n\n'
+            printf -- '- base: %s\n' "$(git rev-parse HEAD)"
+            printf -- '- total_attempts: %s\n' "$attempt"
+            printf -- '- attempts_reaching_palette_keys: %s\n' "$eligible_count"
+            printf -- '- early_aborts_replaced: %s\n' "$early_aborts"
+            printf -- '- target_4827_failures: %s\n' "$target_failures"
+            printf -- '- palette_passes: %s\n' "$palette_passes"
+            printf -- '- full_script_exit_zero: %s\n' "$full_exit_zero"
+            printf -- '- max_attempts: %s\n\n' "$max_attempts"
+            printf 'Eligibility is the immediately preceding PASS palette buttons marker. See results.tsv and complete per-attempt logs.\n'
+          } > "$artifacts/summary.md"
+          cat "$artifacts/summary.md"
+          if [ "$eligible_count" -lt 8 ]; then
+            echo "only $eligible_count eligible palette runs after $attempt attempts" >&2
+            exit 1
+          fi
+
+      - name: Stop only the owned ovis-test herdr session
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/ovis4827-artifacts"
+          if [ -x "$OVIS_HERDR_BIN" ] && [ -d "$XDG_CONFIG_HOME" ]; then
+            "$OVIS_HERDR_BIN" --session "$HERDR_TEST_SESSION" server stop > "$RUNNER_TEMP/ovis4827-artifacts/herdr-stop.log" 2>&1 || true
+          fi
+
+      - name: Upload reproduction artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: palette-keys-macos-baseline
+          path: ${{ runner.temp }}/ovis4827-artifacts
+          if-no-files-found: warn
+          retention-days: 30
